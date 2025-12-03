@@ -44,6 +44,7 @@ void updateLed();
 bool initCamera();
 bool connectWiFi();
 void checkWiFiStatus();
+void warmupCamera(); // Camera warm-up function (declared in app_httpd.cpp)
 
 // ===========================
 // LED Status Management
@@ -148,6 +149,11 @@ bool initCamera() {
   s->set_quality(s, config.jpeg_quality);
   
   Serial.println("Camera initialized successfully");
+  
+  // Warm up the camera: capture and discard a few frames
+  // This ensures reliable captures from the first /snapshot request (no "prime the UI" needed)
+  warmupCamera();
+  
   return true;
 }
 
@@ -284,7 +290,13 @@ void loop() {
       Serial.print("Camera Ready! Use 'http://");
       Serial.print(WiFi.localIP());
       Serial.println("/' to connect");
-      Serial.println("Stream URL for Duet: http://" + WiFi.localIP().toString() + "/stream");
+      Serial.println("");
+      Serial.println("=== DUET WEB CONTROL (DWC) CONFIGURATION ===");
+      Serial.print("DWC Webcam URL: http://");
+      Serial.print(WiFi.localIP());
+      Serial.println(":81/snapshot");
+      Serial.println("Note: /snapshot is on port 81 (separate from UI on port 80)");
+      Serial.println("=============================================");
       setLedMode(LED_MODE_READY);
     } else {
       Serial.println("ERROR: Failed to start HTTP server");

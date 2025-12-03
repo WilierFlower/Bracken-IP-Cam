@@ -1,0 +1,381 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Duet Monitor Cam</title>
+  <style>
+    :root {
+      --bg: #0e1014;
+      --panel: #161a22;
+      --accent: #4ade80;
+      --accent-weak: #a3e635;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --border: #1f2937;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Inter", "Segoe UI", system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      padding: 18px;
+    }
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    h1 {
+      margin: 0;
+      font-size: 1.1rem;
+      letter-spacing: 0.02em;
+    }
+    .subtitle { color: var(--muted); font-size: 0.9rem; margin-top: 4px; }
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 0.9rem;
+    }
+    .badge {
+      padding: 6px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--border);
+      background: #111827;
+      color: var(--muted);
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
+    .badge.waiting { color: #fbbf24; border-color: #fbbf2411; }
+    .badge.live { color: var(--accent); border-color: #4ade8011; }
+    .badge.error { color: #f87171; border-color: #f8717111; }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 1.3fr 1fr;
+      gap: 14px;
+    }
+    @media (max-width: 960px) {
+      .layout { grid-template-columns: 1fr; }
+    }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    }
+
+    .stream-frame {
+      background: #0b0d12;
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 6px;
+      text-align: center;
+      min-height: 220px;
+    }
+    #stream {
+      max-width: 100%;
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid #0f172a;
+      background: #0f172a;
+    }
+
+    .stream-actions {
+      margin-top: 10px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    h2 { margin: 0 0 8px 0; font-size: 1rem; }
+    .control-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+    label { color: var(--muted); font-size: 0.9rem; display: block; margin-bottom: 4px; }
+    select, button {
+      width: 100%;
+      padding: 10px 12px;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: #0b0f17;
+      color: var(--text);
+      font-size: 0.95rem;
+    }
+    select:focus, button:focus { outline: 2px solid #2563eb; outline-offset: 2px; }
+    button.primary { background: linear-gradient(135deg, #22c55e, #16a34a); border: none; color: #0b0f17; font-weight: 700; cursor: pointer; }
+    button.secondary { background: #0b0f17; cursor: pointer; }
+    button:hover { filter: brightness(1.05); }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+
+    .status-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 10px;
+      margin-top: 10px;
+    }
+    .card {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      background: #0f1420;
+    }
+    .label { color: var(--muted); font-size: 0.85rem; }
+    .value { font-size: 1rem; font-weight: 700; margin-top: 4px; }
+
+    .message { margin-top: 10px; font-size: 0.9rem; color: var(--muted); min-height: 20px; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Duet Monitor Cam</h1>
+      <div class="subtitle">Seeed Studio XIAO ESP32-S3 Sense · OV3660</div>
+    </div>
+    <div class="status">
+      <span id="status-dot" class="badge waiting">Waiting</span>
+      <span id="status-text" class="subtitle">Initializing stream...</span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <section class="panel">
+      <div class="stream-frame">
+        <img id="stream" src="/stream" alt="Live stream" />
+      </div>
+      <div class="stream-actions">
+        <button class="secondary" id="reload-btn">Reload Stream</button>
+        <button class="secondary" id="snapshot-btn">Snapshot</button>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Controls</h2>
+      <div class="control-grid">
+        <div>
+          <label for="stream-toggle">Stream Service</label>
+          <select id="stream-toggle">
+            <option value="1">Enabled (live/HomeKit)</option>
+            <option value="0">Disabled (cool/off)</option>
+          </select>
+        </div>
+        <div>
+          <label for="resolution">Resolution</label>
+          <select id="resolution">
+            <option value="svga">SVGA (800x600)</option>
+            <option value="fhd">1080p</option>
+          </select>
+        </div>
+        <div>
+          <label for="quality">JPEG Quality</label>
+          <select id="quality">
+            <option value="12">High (12)</option>
+            <option value="18">Balanced (18)</option>
+            <option value="24">Bandwidth Saver (24)</option>
+          </select>
+        </div>
+        <div>
+          <label for="fps">Stream Pace</label>
+          <select id="fps">
+            <option value="0">30 fps (max)</option>
+            <option value="170">6 fps (cool)</option>
+            <option value="330">3 fps (coolest)</option>
+          </select>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="primary" id="apply-btn">Apply Settings</button>
+        <button class="secondary" id="refresh-status-btn">Refresh Status</button>
+      </div>
+      <div class="status-cards">
+        <div class="card">
+          <div class="label">Current Resolution</div>
+          <div class="value" id="current-res">SVGA</div>
+        </div>
+        <div class="card">
+          <div class="label">JPEG Quality</div>
+          <div class="value" id="current-quality">-</div>
+        </div>
+        <div class="card">
+          <div class="label">Pacing</div>
+          <div class="value" id="current-fps">-</div>
+        </div>
+      </div>
+      <div class="message" id="message"></div>
+    </section>
+  </div>
+
+  <script>
+    const statusDot = document.getElementById('status-dot');
+    const statusText = document.getElementById('status-text');
+    const streamImg = document.getElementById('stream');
+    const resolutionSelect = document.getElementById('resolution');
+    const qualitySelect = document.getElementById('quality');
+    const fpsSelect = document.getElementById('fps');
+    const streamToggle = document.getElementById('stream-toggle');
+    const applyBtn = document.getElementById('apply-btn');
+    const refreshStatusBtn = document.getElementById('refresh-status-btn');
+    const reloadBtn = document.getElementById('reload-btn');
+    const snapshotBtn = document.getElementById('snapshot-btn');
+    const messageBox = document.getElementById('message');
+    const currentRes = document.getElementById('current-res');
+    const currentQuality = document.getElementById('current-quality');
+    const currentFps = document.getElementById('current-fps');
+
+    const fpsLabels = {
+      0: '30 fps (max)',
+      170: '6 fps',
+      330: '3 fps'
+    };
+
+    function setStatus(state, text) {
+      statusDot.classList.remove('waiting', 'live', 'error');
+      statusDot.classList.add(state);
+      statusText.textContent = text;
+    }
+
+    function setMessage(msg, isError = false) {
+      messageBox.textContent = msg || '';
+      messageBox.style.color = isError ? '#f87171' : 'var(--muted)';
+    }
+
+    function stopLocalStream() {
+      streamImg.src = '';
+      setStatus('waiting', 'Stream disabled');
+    }
+
+    function reloadStream() {
+      if (streamToggle.value === '0') {
+        stopLocalStream();
+        return;
+      }
+      setStatus('waiting', 'Reloading stream...');
+      const bust = Date.now();
+      streamImg.src = `/stream?r=${bust}`;
+    }
+
+    async function sendCommand(variable, value) {
+      const resp = await fetch(`/control?var=${variable}&val=${value}`);
+      if (!resp.ok) {
+        throw new Error(`Failed to set ${variable}`);
+      }
+    }
+
+    async function applySettings() {
+      applyBtn.disabled = true;
+      setMessage('Applying settings...');
+      try {
+        await sendCommand('stream', streamToggle.value);
+        await sendCommand('framesize', resolutionSelect.value);
+        await sendCommand('quality', qualitySelect.value);
+        await sendCommand('stream_delay', fpsSelect.value);
+        setMessage('Settings applied. Reloading stream to confirm...');
+        await fetchStatus();
+        if (streamToggle.value === '0') {
+          stopLocalStream();
+        } else {
+          reloadStream();
+        }
+      } catch (err) {
+        console.error(err);
+        setMessage(err.message || 'Failed to apply settings', true);
+      } finally {
+        applyBtn.disabled = false;
+      }
+    }
+
+    async function fetchStatus() {
+      setMessage('Syncing status...');
+      try {
+        const resp = await fetch('/status');
+        if (!resp.ok) throw new Error('Status request failed');
+        const data = await resp.json();
+        // Framesize mapping
+        const fs = (data.framesize_name || '').toLowerCase();
+        if (fs.includes('fhd')) {
+          resolutionSelect.value = 'fhd';
+          currentRes.textContent = '1080p';
+        } else {
+          resolutionSelect.value = 'svga';
+          currentRes.textContent = 'SVGA';
+        }
+        qualitySelect.value = data.quality || '18';
+        currentQuality.textContent = `Q${qualitySelect.value}`;
+
+        const delayVal = Number(data.stream_delay || 0);
+        let closest = 0;
+        let minDiff = Infinity;
+        Object.keys(fpsLabels).forEach(key => {
+          const numKey = Number(key);
+          const diff = Math.abs(numKey - delayVal);
+          if (diff < minDiff) { minDiff = diff; closest = numKey; }
+        });
+        fpsSelect.value = closest.toString();
+        currentFps.textContent = fpsLabels[closest];
+
+        const streamOn = Number(data.stream_enabled || 0) !== 0;
+        streamToggle.value = streamOn ? '1' : '0';
+        if (!streamOn) {
+          stopLocalStream();
+          setMessage('Stream is disabled. Snapshot remains available at /snapshot.');
+        }
+
+        setMessage('Status synchronized.');
+      } catch (err) {
+        console.error(err);
+        setMessage('Unable to read status.', true);
+      }
+    }
+
+    streamImg.addEventListener('load', () => {
+      setStatus('live', 'Stream active');
+    });
+
+    streamImg.addEventListener('error', () => {
+      if (streamToggle.value === '0') {
+        stopLocalStream();
+        return;
+      }
+      setStatus('waiting', 'Waiting for stream...');
+      setTimeout(reloadStream, 2000);
+    });
+
+    applyBtn.addEventListener('click', applySettings);
+    refreshStatusBtn.addEventListener('click', fetchStatus);
+    reloadBtn.addEventListener('click', reloadStream);
+    snapshotBtn.addEventListener('click', () => {
+      window.open('/snapshot', '_blank');
+    });
+
+    streamToggle.addEventListener('change', () => {
+      if (streamToggle.value === '0') {
+        stopLocalStream();
+        setMessage('Stream disabled until you apply. /snapshot stays on for Duet.');
+      } else {
+        setMessage('Stream enabled. Apply to activate with new settings.');
+      }
+    });
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && streamToggle.value !== '0') {
+        reloadStream();
+      }
+    });
+
+    fetchStatus();
+  </script>
+</body>
+</html>

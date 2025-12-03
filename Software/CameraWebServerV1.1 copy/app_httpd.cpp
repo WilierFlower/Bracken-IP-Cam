@@ -1,0 +1,473 @@
+#include "esp_http_server.h"
+#include "esp_timer.h"
+#include "esp_camera.h"
+#include "img_converters.h"
+#include "camera_index.h"
+#include "board_config.h"
+
+#include <esp32-hal-psram.h>
+#include <WiFi.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
+
+#if defined(ARDUINO_ARCH_ESP32) && defined(CONFIG_ARDUHAL_ESP_LOG)
+#include "esp32-hal-log.h"
+#endif
+
+// External flag to track server status
+extern bool server_started;
+
+// HTTP server handle (single server on port 80)
+static httpd_handle_t camera_httpd = nullptr;
+
+// User-tunable stream pacing (set via /control?var=stream_delay&val=###)
+static uint16_t stream_delay_ms = 0;
+
+typedef struct {
+  httpd_req_t *req;
+  size_t len;
+} jpg_chunking_t;
+
+#define PART_BOUNDARY "123456789000000000000987654321"
+static const char *_STREAM_CONTENT_TYPE = "multipart/x-mixed-replace;boundary=" PART_BOUNDARY;
+static const char *_STREAM_BOUNDARY = "\r\n--" PART_BOUNDARY "\r\n";
+static const char *_STREAM_PART = "Content-Type: image/jpeg\r\nContent-Length: %u\r\nX-Timestamp: %d.%06d\r\n\r\n";
+
+static size_t jpg_encode_stream(void *arg, size_t index, const void *data, size_t len) {
+  jpg_chunking_t *j = (jpg_chunking_t *)arg;
+  if (!index) {
+    j->len = 0;
+  }
+  if (httpd_resp_send_chunk(j->req, (const char *)data, len) != ESP_OK) {
+    return 0;
+  }
+  j->len += len;
+  return len;
+}
+
+// /capture and /snapshot: single JPEG frame
+static esp_err_t capture_handler(httpd_req_t *req) {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    log_e("Camera capture failed");
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_type(req, "image/jpeg");
+  httpd_resp_set_hdr(req, "Content-Disposition", "inline; filename=capture.jpg");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  esp_err_t res;
+  if (fb->format == PIXFORMAT_JPEG) {
+    res = httpd_resp_send(req, (const char *)fb->buf, fb->len);
+  } else {
+    jpg_chunking_t jchunk = {req, 0};
+    res = frame2jpg_cb(fb, 80, jpg_encode_stream, &jchunk) ? ESP_OK : ESP_FAIL;
+    httpd_resp_send_chunk(req, NULL, 0);
+  }
+
+  esp_camera_fb_return(fb);
+  return res;
+}
+
+// /stream: MJPEG stream (Duet Web Control webcam URL)
+// Optimized for stability and performance
+static esp_err_t stream_handler(httpd_req_t *req) {
+  camera_fb_t *fb = NULL;
+  struct timeval _timestamp;
+  esp_err_t res = ESP_OK;
+  size_t _jpg_buf_len = 0;
+  uint8_t *_jpg_buf = NULL;
+  char part_buf[128];
+
+  static int64_t last_frame = 0;
+  static uint32_t frame_counter = 0;
+  static uint32_t error_count = 0;
+
+  res = httpd_resp_set_type(req, _STREAM_CONTENT_TYPE);
+  if (res != ESP_OK) {
+    log_e("Failed to set stream content type");
+    return res;
+  }
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+
+  log_i("Stream client connected");
+
+  while (true) {
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      error_count++;
+      log_e("Camera capture failed (error count: %u)", error_count);
+      
+      // If too many consecutive errors, break the stream
+      if (error_count > 10) {
+        log_e("Too many capture errors, closing stream");
+        res = ESP_FAIL;
+        break;
+      }
+      
+      // Small delay before retry
+      vTaskDelay(50 / portTICK_PERIOD_MS);
+      continue;
+    }
+    
+    // Reset error count on successful capture
+    error_count = 0;
+    
+    _timestamp.tv_sec = fb->timestamp.tv_sec;
+    _timestamp.tv_usec = fb->timestamp.tv_usec;
+    
+    if (fb->format != PIXFORMAT_JPEG) {
+      // Convert non-JPEG format to JPEG
+      bool jpeg_converted = frame2jpg(fb, 80, &_jpg_buf, &_jpg_buf_len);
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      
+      if (!jpeg_converted || !_jpg_buf || _jpg_buf_len == 0) {
+        log_e("JPEG compression failed");
+        if (_jpg_buf) {
+          free(_jpg_buf);
+          _jpg_buf = NULL;
+        }
+        res = ESP_FAIL;
+        break;
+      }
+    } else {
+      _jpg_buf_len = fb->len;
+      _jpg_buf = fb->buf;
+    }
+
+    // Send boundary
+    if (res == ESP_OK) {
+      res = httpd_resp_send_chunk(req, _STREAM_BOUNDARY, strlen(_STREAM_BOUNDARY));
+    }
+    
+    // Send header
+    if (res == ESP_OK) {
+      size_t hlen = snprintf(part_buf, sizeof(part_buf), _STREAM_PART, 
+                             _jpg_buf_len, _timestamp.tv_sec, _timestamp.tv_usec);
+      if (hlen < sizeof(part_buf)) {
+        res = httpd_resp_send_chunk(req, part_buf, hlen);
+      } else {
+        log_e("Header buffer overflow");
+        res = ESP_FAIL;
+      }
+    }
+    
+    // Send image data
+    if (res == ESP_OK && _jpg_buf && _jpg_buf_len > 0) {
+      res = httpd_resp_send_chunk(req, (const char *)_jpg_buf, _jpg_buf_len);
+    }
+
+    // Free frame buffer
+    if (fb) {
+      esp_camera_fb_return(fb);
+      fb = NULL;
+      _jpg_buf = NULL; // Don't free, it's part of fb
+    } else if (_jpg_buf) {
+      free(_jpg_buf);
+      _jpg_buf = NULL;
+    }
+
+    if (res != ESP_OK) {
+      log_e("Stream send error: %d", res);
+      break;
+    }
+
+    // Frame rate logging (every 30 frames)
+    int64_t now = esp_timer_get_time();
+    if (last_frame > 0) {
+      int64_t frame_time = (now - last_frame) / 1000;
+      if (++frame_counter % 30 == 0 && frame_time > 0) {
+        log_i("Stream: %ums/frame (%.1ffps)", (uint32_t)frame_time, 1000.0 / frame_time);
+      }
+    }
+    last_frame = now;
+
+    // Optional frame rate limiting
+    if (stream_delay_ms > 0) {
+      vTaskDelay(stream_delay_ms / portTICK_PERIOD_MS);
+    }
+  }
+
+  log_i("Stream client disconnected");
+  
+  // Cleanup
+  if (fb) {
+    esp_camera_fb_return(fb);
+  }
+  if (_jpg_buf && !fb) {
+    free(_jpg_buf);
+  }
+
+  return res;
+}
+
+// /: Serve HTML UI
+static esp_err_t index_handler(httpd_req_t *req) {
+  httpd_resp_set_type(req, "text/html");
+  httpd_resp_set_hdr(req, "Content-Encoding", "gzip");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, (const char *)index_ov3660_html_gz, index_ov3660_html_gz_len);
+}
+
+// Helper: Parse framesize value
+static framesize_t framesize_from_value(const char *value) {
+  if (!value) {
+    return FRAMESIZE_SVGA;
+  }
+
+  if (strcasecmp(value, "svga") == 0) {
+    return FRAMESIZE_SVGA;
+  }
+  if (strcasecmp(value, "fhd") == 0 || strcasecmp(value, "1080p") == 0) {
+    return FRAMESIZE_FHD;
+  }
+
+  int idx = atoi(value);
+  if (idx >= 0 && idx < FRAMESIZE_INVALID) {
+    return (framesize_t)idx;
+  }
+  return FRAMESIZE_SVGA;
+}
+
+// Helper: Get framesize name
+static const char *framesize_name(framesize_t size) {
+  switch (size) {
+    case FRAMESIZE_FHD:
+      return "FHD";
+    case FRAMESIZE_SVGA:
+      return "SVGA";
+    default:
+      return "CUSTOM";
+  }
+}
+
+// /control: Camera controls (framesize, quality, stream_delay, vflip, hmirror)
+static esp_err_t cmd_handler(httpd_req_t *req) {
+  char variable[32];
+  char value[32];
+
+  if (httpd_req_get_url_query_len(req) == 0) {
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+
+  char *buf = (char *)malloc(httpd_req_get_url_query_len(req) + 1);
+  if (!buf) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  esp_err_t res = ESP_OK;
+  if (httpd_req_get_url_query_str(req, buf, httpd_req_get_url_query_len(req) + 1) != ESP_OK ||
+      httpd_query_key_value(buf, "var", variable, sizeof(variable)) != ESP_OK ||
+      httpd_query_key_value(buf, "val", value, sizeof(value)) != ESP_OK) {
+    res = ESP_FAIL;
+  }
+  free(buf);
+
+  if (res != ESP_OK) {
+    httpd_resp_send_404(req);
+    return ESP_FAIL;
+  }
+
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  int val = atoi(value);
+  
+  if (!strcmp(variable, "framesize")) {
+    framesize_t target = framesize_from_value(value);
+    if (!psramFound() && target > FRAMESIZE_SVGA) {
+      log_w("PSRAM not available, limiting to SVGA");
+      target = FRAMESIZE_SVGA;
+    }
+    res = s->set_framesize(s, target);
+    log_i("Set framesize to %s", framesize_name(target));
+    
+  } else if (!strcmp(variable, "quality")) {
+    if (val < 5) val = 5;
+    if (val > 63) val = 63;
+    res = s->set_quality(s, val);
+    log_i("Set quality to %d", val);
+    
+  } else if (!strcmp(variable, "stream_delay")) {
+    if (val < 0) val = 0;
+    if (val > 500) val = 500;
+    stream_delay_ms = (uint16_t)val;
+    log_i("Set stream_delay to %ums", stream_delay_ms);
+    
+  } else if (!strcmp(variable, "vflip")) {
+    if (val < 0) val = 0;
+    if (val > 1) val = 1;
+    res = s->set_vflip(s, val);
+    log_i("Set vflip to %d", val);
+    
+  } else if (!strcmp(variable, "hmirror")) {
+    if (val < 0) val = 0;
+    if (val > 1) val = 1;
+    res = s->set_hmirror(s, val);
+    log_i("Set hmirror to %d", val);
+    
+  } else {
+    log_w("Unknown control variable: %s", variable);
+    res = ESP_FAIL;
+  }
+
+  if (res != ESP_OK) {
+    httpd_resp_send_500(req);
+    return ESP_FAIL;
+  }
+
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, NULL, 0);
+}
+
+// /status: JSON status with resolution, quality, fps, orientation
+static esp_err_t status_handler(httpd_req_t *req) {
+  sensor_t *s = esp_camera_sensor_get();
+  if (!s) {
+    return httpd_resp_send_500(req);
+  }
+
+  char json_response[256];
+  int len = snprintf(json_response, sizeof(json_response),
+                     "{\"framesize\":%u,\"framesize_name\":\"%s\",\"quality\":%u,"
+                     "\"stream_delay\":%u,\"vflip\":%u,\"hmirror\":%u,"
+                     "\"wifi_rssi\":%d}",
+                     s->status.framesize, 
+                     framesize_name((framesize_t)s->status.framesize),
+                     s->status.quality, 
+                     stream_delay_ms,
+                     s->status.vflip,
+                     s->status.hmirror,
+                     WiFi.RSSI());
+
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, json_response, len);
+}
+
+// /health: Simple health check endpoint
+static esp_err_t health_handler(httpd_req_t *req) {
+  bool camera_ok = (esp_camera_sensor_get() != nullptr);
+  bool wifi_ok = (WiFi.status() == WL_CONNECTED);
+  bool server_ok = (camera_httpd != nullptr);
+  
+  const char *status = (camera_ok && wifi_ok && server_ok) ? "OK" : "ERROR";
+  
+  char response[128];
+  int len = snprintf(response, sizeof(response),
+                     "{\"status\":\"%s\",\"camera\":%s,\"wifi\":%s,\"server\":%s}",
+                     status,
+                     camera_ok ? "true" : "false",
+                     wifi_ok ? "true" : "false",
+                     server_ok ? "true" : "false");
+  
+  httpd_resp_set_type(req, "application/json");
+  httpd_resp_set_hdr(req, "Access-Control-Allow-Origin", "*");
+  return httpd_resp_send(req, response, len);
+}
+
+// Start HTTP server on port 80 with all handlers
+void startCameraServer() {
+  // Prevent multiple starts
+  if (camera_httpd != nullptr) {
+    log_w("HTTP server already started");
+    server_started = true;
+    return;
+  }
+
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.max_uri_handlers = 12; // Enough for all handlers
+  config.lru_purge_enable = true; // Enable LRU purge for better memory management
+
+  // Start server
+  esp_err_t err = httpd_start(&camera_httpd, &config);
+  if (err != ESP_OK) {
+    log_e("Failed to start HTTP server: %d", err);
+    server_started = false;
+    return;
+  }
+
+  // Register all URI handlers
+  httpd_uri_t index_uri = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = index_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t status_uri = {
+    .uri = "/status",
+    .method = HTTP_GET,
+    .handler = status_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t cmd_uri = {
+    .uri = "/control",
+    .method = HTTP_GET,
+    .handler = cmd_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t capture_uri = {
+    .uri = "/capture",
+    .method = HTTP_GET,
+    .handler = capture_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t snapshot_uri = {
+    .uri = "/snapshot",
+    .method = HTTP_GET,
+    .handler = capture_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t stream_uri = {
+    .uri = "/stream",
+    .method = HTTP_GET,
+    .handler = stream_handler,
+    .user_ctx = NULL
+  };
+
+  httpd_uri_t health_uri = {
+    .uri = "/health",
+    .method = HTTP_GET,
+    .handler = health_handler,
+    .user_ctx = NULL
+  };
+
+  // Register handlers
+  httpd_register_uri_handler(camera_httpd, &index_uri);
+  httpd_register_uri_handler(camera_httpd, &status_uri);
+  httpd_register_uri_handler(camera_httpd, &cmd_uri);
+  httpd_register_uri_handler(camera_httpd, &capture_uri);
+  httpd_register_uri_handler(camera_httpd, &snapshot_uri);
+  httpd_register_uri_handler(camera_httpd, &stream_uri);
+  httpd_register_uri_handler(camera_httpd, &health_uri);
+
+  log_i("HTTP server started on port 80");
+  log_i("Endpoints: /, /stream, /capture, /snapshot, /status, /control, /health");
+  
+  server_started = true;
+}
+
+// Legacy function (kept for compatibility, but LED is now handled in main sketch)
+void setupLedFlash() {
+#if defined(LED_GPIO_NUM)
+  ledcAttach(LED_GPIO_NUM, 5000, 8);
+#else
+  log_i("LED flash is disabled -> LED_GPIO_NUM undefined");
+#endif
+}
